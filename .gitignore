@@ -1,0 +1,10 @@
+# CSV files
+*.csv
+
+# 기타 권장 항목
+__pycache__/
+.ipynb_checkpoints/
+*.log
+*.checkpoint
+*.pt
+.DS_Store
