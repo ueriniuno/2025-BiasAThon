@@ -13,11 +13,13 @@ torch.backends.cudnn.benchmark = True          # MPS/CPU 속도 튜닝
 torch.manual_seed(42)
 
 # ─────────────────────────  추론 루프  ─────────────────────────
+from typing import Optional
+
 def run_inference(
     input_csv: str,
     output_csv: str,
     batch_size: int = 100,
-    resume_from_id: str | None = None,
+    resume_from_id: Optional[str] = None,
     dyn_batch: int = 2,
     max_new_tokens: int = 32,
 ):
@@ -82,8 +84,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run_inference(
-        "test.csv",
-        "baseline_submission.csv",
+        "Yeogyeong/test.csv",
+        "Yeogyeong/baseline_submission.csv",
         batch_size=args.batch_size,
         resume_from_id=args.resume_from_id,
         dyn_batch=args.dyn_batch,
