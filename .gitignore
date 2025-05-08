@@ -8,3 +8,6 @@ __pycache__/
 *.checkpoint 
 *.pt
 .DS_Store
+
+*.pkl
+*.index

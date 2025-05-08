@@ -1,91 +1,104 @@
 # main.py
-import argparse
-import gc
-import torch
-from tqdm import tqdm 
-import pandas as pd
+import argparse, os, gc, pandas as pd
+from joblib import Parallel, delayed
+from data_loader   import load_data         # 그대로
+from model_runner  import load_model, predict_batch_answers
+from retriever     import get_relevant      # 필요 시 warm-up
+import torch, warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
-from data_loader import load_data
-from model_runner import load_model, predict_batch_answers
+# ---------------- Args ------------- #
+parser = argparse.ArgumentParser()
+parser.add_argument("--input_csv", default="test.csv")
+parser.add_argument("--output_csv", default="submission.csv")
+parser.add_argument("--batch_size", type=int, default=10)
+parser.add_argument("--dyn_batch",  type=int, default=2)
+parser.add_argument("--max_new_tokens", type=int, default=32)
+parser.add_argument("--num_workers", type=int, default=2)
+parser.add_argument("--sample_size", type=int, default=None)   # None이면 전체 사용
+parser.add_argument("--seed", type=int, default=42)
+args = parser.parse_args()
+# ----------------------------------- #
+# main.py  (import 바로 아래)
+SAVE_EVERY = 500                     # ✅ 500행마다 저장
+RESUME     = True                    # 중간 CSV가 있으면 이어서
+# ----- 모델 1회 로드 ----- #
+tokenizer, model = load_model()   # Llama
+get_relevant("warm-up", k=1)      # SBERT warm-up
+# ------------------------ #
 
-# ─────────────────────────  기본 설정  ─────────────────────────
-torch.backends.cudnn.benchmark = True          # MPS/CPU 속도 튜닝
-torch.manual_seed(42)
-
-# ─────────────────────────  추론 루프  ─────────────────────────
-def run_inference(
-    input_csv: str,
-    output_csv: str,
-    batch_size: int = 100,
-    resume_from_id: str | None = None,
-    dyn_batch: int = 2,
-    max_new_tokens: int = 32,
-):
-    # 1) 데이터 · 모델 로드
-    data = load_data(input_csv)
-    tokenizer, model = load_model()
-
-    # 2) 열 타입 고정 (경고 방지)
-    for col in ["raw_input", "raw_output", "answer"]:
-        data[col] = data[col].astype("string")
-
-    # 3) 재시작 위치 결정
-    if resume_from_id:
-        idx_list = data.index[data["ID"] == resume_from_id].tolist()
-        if not idx_list:
-            raise ValueError(f"{resume_from_id} not found in the dataset.")
-        start_idx = idx_list[0] + 1
-        print(f"🔄  {resume_from_id} 이후 index {start_idx}부터 재시작")
-    else:
-        start_idx = 0
-
-    # 4) 배치 추론
-    for i in tqdm(range(start_idx, len(data), batch_size), desc="Processing"):
-        batch = data.iloc[i : i + batch_size]
-
-        prompts, raws, answers = predict_batch_answers(
-            tokenizer,
-            model,
-            batch["context"].tolist(),
-            batch["question"].tolist(),
-            batch["choices"].tolist(),
-            max_new_tokens=max_new_tokens,
-            dyn_bs=dyn_batch,
+def process_chunk(chunk):
+    """chunk(DataFrame) 단위 infer"""
+    bs = args.batch_size
+    for i in range(0, len(chunk), bs):
+        sub = chunk.iloc[i:i+bs]
+        p,r,a = predict_batch_answers(
+            tokenizer, model,
+            sub["context"].tolist(),
+            sub["question"].tolist(),
+            sub["choices"].tolist(),
+            max_new_tokens=args.max_new_tokens,
+            dyn_bs=args.dyn_batch,
         )
+        # Explicitly cast columns to str to avoid dtype warnings during assignment
+        chunk["raw_input"] = chunk["raw_input"].astype(str)
+        chunk["raw_output"] = chunk["raw_output"].astype(str)
+        chunk["answer"] = chunk["answer"].astype(str)
+        chunk.loc[sub.index, ["raw_input","raw_output","answer"]] = list(zip(p,r,a))
+    torch.mps.empty_cache(); gc.collect()
+    return chunk
 
-        data.loc[batch.index, "raw_input"]  = prompts
-        data.loc[batch.index, "raw_output"] = raws
-        data.loc[batch.index, "answer"]     = answers
+def run_inference():
+    df = load_data(args.input_csv, sample_size=args.sample_size, seed=args.seed)
 
-        # 5) 중간 저장
-        if i % 500 == 0 and i > 0:
-            path = f"submission_checkpoint_{i}.csv"
-            tqdm.write(f"💾  {i}/{len(data)} 저장 → {path}")
-            data[["ID", "raw_input", "raw_output", "answer"]].to_csv(
-                path, index=False, encoding="utf-8-sig"
-            )
-            torch.mps.empty_cache(); gc.collect()
+    if RESUME and os.path.exists(args.output_csv):
+        done_df = pd.read_csv(args.output_csv)
+        df      = df[~df["ID"].isin(done_df["ID"])]
+        print(f"⏩  Resume mode: {len(done_df)} rows already done")
 
-    # 6) 최종 저장
-    data[["ID", "raw_input", "raw_output", "answer"]].to_csv(
-        output_csv, index=False, encoding="utf-8-sig"
-    )
-    print(f"🎉  최종 제출 파일 저장 완료: {output_csv}")
+    n = len(df)
+    print(f"🔸 Remaining samples: {n}")
 
-# ─────────────────────────  CLI  ─────────────────────────
+    chunk_size = 100
+    chunks = [df.iloc[i:i+chunk_size] for i in range(0, n, chunk_size)]
+
+    buffered, total_written = [], 0
+    header_written = os.path.exists(args.output_csv)
+
+    for res in Parallel(n_jobs=args.num_workers,
+                        backend="threading")(
+            delayed(process_chunk)(c.copy()) for c in chunks):
+        buffered.append(res)
+
+        if sum(len(x) for x in buffered) >= SAVE_EVERY:
+            _flush(buffered, header_written)
+            total_written += sum(len(x) for x in buffered)
+            buffered.clear()
+            header_written = True
+            print(f"💾  {total_written} rows saved → {args.output_csv}")
+
+    if buffered:
+        _flush(buffered, header_written)
+        total_written += sum(len(x) for x in buffered)
+        print(f"💾  {total_written} rows saved (final)")
+
+def _flush(dfs, header_written):
+    out_df = pd.concat(dfs).sort_index()
+    out_df = out_df.drop(columns=["context", "question", "choices"], errors="ignore")
+    # Load sample_submission and merge
+    sample_df = pd.read_csv("sample_submission.csv")
+    merged_df = sample_df.copy()
+    merged_df = merged_df.merge(out_df, on="ID", how="left", suffixes=("", "_new"))
+
+    for col in ["answer", "raw_input", "raw_output"]:
+        if f"{col}_new" in merged_df.columns:
+            merged_df[col] = merged_df[f"{col}_new"].combine_first(merged_df[col])
+            merged_df.drop(columns=[f"{col}_new"], inplace=True)
+
+    out_df = merged_df
+    mode   = "a" if header_written else "w"
+    out_df.to_csv(args.output_csv, mode=mode, index=False, encoding="utf-8-sig",
+                  header=not header_written)
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--batch_size", type=int, default=100, help="CSV 배치 크기")
-    parser.add_argument("--dyn_batch",  type=int, default=2,   help="모델 입력 동적 배치(1‑2 권장)")
-    parser.add_argument("--resume_from_id", type=str, default=None, help="재시작할 ID")
-    parser.add_argument("--max_new_tokens", type=int, default=32, help="generate 토큰 길이")
-    args = parser.parse_args()
-
-    run_inference(
-        "test.csv",
-        "baseline_submission.csv",
-        batch_size=args.batch_size,
-        resume_from_id=args.resume_from_id,
-        dyn_batch=args.dyn_batch,
-        max_new_tokens=args.max_new_tokens,
-    )
+    run_inference()
