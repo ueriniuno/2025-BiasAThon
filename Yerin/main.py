@@ -1,7 +1,9 @@
 import argparse, os, gc, pandas as pd
 from joblib import Parallel, delayed
-from data_loader import load_data         # 그대로
-from model_runner import load_model, predict_batch_answers
+from data_loader import load_data
+from model_runner import load_pipeline_model, predict_batch_answers_with_pipeline
+from prompt_engineer import make_prompt
+import argparse, pandas as pd, os
 import torch, warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 print(load_data.__module__)
@@ -25,36 +27,44 @@ args = parser.parse_args()
 # main.py  (import 바로 아래)
 SAVE_EVERY = 500                     # ✅ 500행마다 저장
 RESUME = True                    # 중간 CSV가 있으면 이어서
-# ----- 모델 1회 로드 ----- #
-tokenizer, model = load_model()  # Llama
+
+# # 데이터 로딩
+# df = load_data(args.input_csv, sample_size=args.sample_size, seed=args.seed)
+
+# # 프롬프트 미리 생성
+# df["prompt"] = df.apply(lambda row: make_prompt(row["context"], row["question"], row["choices"]), axis=1)
+
+# 모델 로드 (pipeline 기반)
+pipe = load_pipeline_model()
+
 # ------------------------ #
 # DataFrame의 일부 chunk를 받아서 한 번에 배치 단위로 inference 수행
 def process_chunk(chunk):
     """chunk(DataFrame) 단위 infer"""
-    bs = args.batch_size
-    for i in range(0, len(chunk), bs):
-        sub = chunk.iloc[i:i+bs]
-        p,r,a = predict_batch_answers(
-            tokenizer, model,
-            sub["context"].tolist(),
-            sub["question"].tolist(),
-            sub["choices"].tolist(),
-            max_new_tokens=args.max_new_tokens,
-            dyn_bs=args.dyn_batch,
-        )
-        # Explicitly cast columns to str to avoid dtype warnings during assignment
-        chunk["raw_input"] = chunk["raw_input"].astype(str)
-        chunk["raw_output"] = chunk["raw_output"].astype(str)
-        chunk["answer"] = chunk["answer"].astype(str)
-        chunk.loc[sub.index, ["raw_input","raw_output","answer"]] = list(zip(p,r,a))
-    torch.mps.empty_cache(); gc.collect()
+    prompts = chunk.apply(
+        lambda row: make_prompt(row["context"], row["question"], row["choices"]),
+        axis=1
+    ).tolist()
+
+    choices = chunk["choices"].tolist()
+
+    p, r, a = predict_batch_answers_with_pipeline(pipe, prompts, choices, batch_size=args.batch_size)
+
+    chunk["raw_input"] = p
+    chunk["raw_output"] = r
+    chunk["answer"] = a
+
+    # ✅ 바로 저장 (flush 함수 재사용)
+    _flush([chunk], header_written=os.path.exists(args.output_csv))
+    print(f"💾 Saved chunk of {len(chunk)} rows → {args.output_csv}")
+
     return chunk
 
 def run_inference(input_csv: str, output_csv: str, batch_size: int):
-    df = load_data(input_csv)
+    df = load_data(input_csv, sample_size=args.sample_size, seed=args.seed)
 
-    if RESUME and os.path.exists(args.output_csv):
-        done_df = pd.read_csv(args.output_csv)
+    if RESUME and os.path.exists(output_csv):
+        done_df = pd.read_csv(output_csv)
         df = df[~df["ID"].isin(done_df["ID"])]
         print(f"⏩  Resume mode: {len(done_df)} rows already done")
 
@@ -64,25 +74,29 @@ def run_inference(input_csv: str, output_csv: str, batch_size: int):
     chunk_size = 100
     chunks = [df.iloc[i:i+chunk_size] for i in range(0, n, chunk_size)]
 
-    buffered, total_written = [], 0
-    header_written = os.path.exists(args.output_csv)
+    # 수정
+    # buffered, total_written = [], 0
+    # header_written = os.path.exists(output_csv)
+    #
+    # for chunk in chunks:
+    #     res = process_chunk(chunk.copy())
+    #     buffered.append(res)
 
-     # 🔽 병렬처리 제거하고 일반 for 루프로 변경
-    for chunk in chunks:
-        res = process_chunk(chunk.copy())
-        buffered.append(res)
+    #     if sum(len(x) for x in buffered) >= SAVE_EVERY:
+    #         _flush(buffered, header_written)
+    #         total_written += sum(len(x) for x in buffered)
+    #         buffered.clear()
+    #         header_written = True
+    #         print(f"💾  {total_written} rows saved → {output_csv}")
 
-        if sum(len(x) for x in buffered) >= SAVE_EVERY:
-            _flush(buffered, header_written)
-            total_written += sum(len(x) for x in buffered)
-            buffered.clear()
-            header_written = True
-            print(f"💾  {total_written} rows saved → {args.output_csv}")
+    # if buffered:
+    #     _flush(buffered, header_written)
+    #     total_written += sum(len(x) for x in buffered)
+    #     print(f"💾  {total_written} rows saved (final)")
 
-    if buffered:
-        _flush(buffered, header_written)
-        total_written += sum(len(x) for x in buffered)
-        print(f"💾  {total_written} rows saved (final)")
+    for i, chunk in enumerate(chunks):
+        _ = process_chunk(chunk.copy())
+        gc.collect()
         
 # 결과 데이터프레임들 하나로 모음. sample_submission과 merge하여 누락값 보완 
 def _flush(dfs, header_written):
@@ -104,4 +118,4 @@ def _flush(dfs, header_written):
                   header=not header_written)
 
 if __name__ == "__main__":
-    run_inference("test.csv", "baseline_submission.csv", batch_size=args.batch_size)
+    run_inference(args.input_csv, args.output_csv, args.batch_size)
